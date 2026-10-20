@@ -1,0 +1,202 @@
+#!/bin/bash
+# ============================================================
+# vangrr Gate-0：计算节点能力探测 —— OSWorld 能不能在 ABCI 上跑
+#
+# 每一项结论写成 summary.txt 里一行 key=value（logs/probe/<jobid>/），实时日志 probe.log：
+#   [1] 节点规格（CPU / 内存 / GPU / 本地盘 / CUDA_VISIBLE_DEVICES 形态）
+#   [2] /dev/kvm 是否存在、可读写
+#   [3] 计算节点外网：ABCI 文档写出站放行 22/53/80/443；本账号其他项目的笔记和抢占教程都写"不能上网"，以实测为准
+#   [4] 容器：osworld-docker.sif 能否挂载（setuid / --userns 两种）、容器内 QEMU 能否开 KVM
+#   [5] VM 镜像：zip 已在登录节点下好；这里校验 sha256 后原子解压（先解到临时目录再 mv）
+#   [6] 单台 VM 起机：VM 内 server(5000) 就绪耗时、截图、VM 内能否上网
+#   [7] 并发起 NVM 台（默认 16）VM：各台就绪耗时、各自截图
+#
+# 零 GPU，纯 bash + curl + singularity，不跑 Python。预计 15–40 分钟，跑完自然退出。
+# 抢占（白名单用户挤占，SIGTERM / Exit_status 271）：trap 写 outcome=term、停掉所有 VM、exit 143；
+#   本脚本幂等（zip 已校验/已解压就跳过），被挤后原样重投即可：qsub abci/pbs/probe_node.pbs
+# 提交： qsub abci/pbs/probe_node.pbs        改并发台数： qsub -v "RTYPE=rt_HF,NVM=24" abci/pbs/probe_node.pbs
+# ============================================================
+#PBS -N 0314_grr_probe
+#PBS -P gcg51557
+#PBS -q R9920261000
+#PBS -v RTYPE=rt_HF
+#PBS -l select=1
+#PBS -l walltime=01:30:00
+#PBS -j oe
+#PBS -o /groups/gcg51557/experiments/0314_clip-modality-gap/vangrr/logs/pbs_out/
+
+set -uo pipefail
+trap '' PIPE   # tee 先被 SIGTERM 杀掉时，后续 echo 只报错、不把脚本带走
+ROOT=/groups/gcg51557/experiments/0314_clip-modality-gap/vangrr
+JID=${PBS_JOBID:-manual$$}; JID=${JID%%.*}
+OUT=$ROOT/logs/probe/$JID
+mkdir -p "$OUT"
+OUTCOME=$OUT/outcome
+outcome() { echo "$1" > "$OUTCOME" 2>/dev/null || true; }
+outcome none
+# PBS 的 .o 文件作业结束才回写，实时进度看这个 tee 出来的 probe.log
+exec > >(tee -a "$OUT/probe.log") 2>&1
+SUM=$OUT/summary.txt; : > "$SUM"
+kv()  { echo "$1=$2" | tee -a "$SUM"; }
+sec() { echo; echo "=== [$1] $(date '+%F %T') ==="; }
+
+LOCAL=${PBS_LOCALDIR:-/tmp}
+export TMPDIR=/tmp/g18422-$JID   # ~/.bashrc 把 TMPDIR 指向已满的 /home；路径要短（UNIX socket < 108 字节）
+mkdir -p "$TMPDIR"
+export VM_RUN_DIR=$LOCAL/grr_vms
+export SINGULARITY_CACHEDIR=$ROOT/vm/sif_cache   # 家目录配额已满，缓存不许落 ~
+export SINGULARITY_TMPDIR=$LOCAL
+SIF=$ROOT/vm/osworld-docker.sif
+LVM=$ROOT/abci/vm/launch_vm.sh
+BASE=$ROOT/vm/Ubuntu.qcow2
+ZIP=$ROOT/vm/Ubuntu.qcow2.zip
+ZIP_URL=https://huggingface.co/datasets/xlangai/ubuntu_osworld/resolve/main/Ubuntu.qcow2.zip
+ZIP_BYTES=12273896463
+ZIP_SHA256=b795b6cd4c69b252c1b4f10150a347795555032501b60fd031751ed09b896712   # HF x-linked-etag
+NVM=${NVM:-16}
+
+stop_vms() { for s in $(seq 0 "$NVM"); do bash "$LVM" stop "$s" > /dev/null 2>&1 || true; done; }
+trap 'stop_vms; rm -rf "$TMPDIR" "$ROOT/vm/.unzip-$JID"' EXIT
+trap 'outcome term; echo "SIGTERM (preemption or walltime): stopping VMs"; stop_vms; exit 143' TERM
+
+slug() { echo "$1" | sed -E 's#^https?://##; s#[^A-Za-z0-9]+#_#g; s#_+$##'; }
+probe_url() {  # 打印 "<http_code> rc=<curl rc> <秒>"
+  local out rc
+  out=$(curl -s -o /dev/null -w '%{http_code} %{time_total}s' --max-time "${2:-15}" "$1"); rc=$?
+  echo "${out%% *} rc=$rc ${out#* }"
+}
+vm_exec() {    # vm_exec <server_port> <shell command>：打印 VM 内 stdout+stderr（失败时打印原始返回）
+  local payload res
+  payload=$(jq -nc --arg c "$2" '{command: $c, shell: true}')
+  res=$(curl -s --max-time 90 -X POST -H 'Content-Type: application/json' -d "$payload" "http://127.0.0.1:$1/execute")
+  echo "$res" | jq -r 'if .status == "success" then (.output + .error) else tostring end' 2>/dev/null || echo "$res"
+}
+port_of() { echo $((20000 + $1 * 10)); }
+
+sec "1 节点规格"
+kv job "$JID"
+kv host "$(hostname)"
+kv ncpu "$(nproc)"
+kv cpu_model "$(lscpu | sed -n 's/^Model name: *//p' | head -1)"
+kv mem_total_gb "$(free -g | awk '/^Mem:/{print $2}')"
+kv gpus "$(nvidia-smi -L 2>/dev/null | wc -l)"
+kv gpu_name "$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+kv gpu_driver "$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)"
+kv cuda_visible_devices "${CUDA_VISIBLE_DEVICES:-unset}"
+kv pbs_localdir "${PBS_LOCALDIR:-unset}"
+kv localdir_avail "$(df -h --output=avail "$LOCAL" | tail -1 | tr -d ' ')"
+kv shm_avail "$(df -h --output=avail /dev/shm | tail -1 | tr -d ' ')"
+ulimit -a | grep -E 'processes|open files'
+
+sec "2 KVM"
+ls -la /dev/kvm 2>&1
+kv kvm_dev "$([ -c /dev/kvm ] && echo yes || echo no)"
+kv kvm_rw "$([ -r /dev/kvm ] && [ -w /dev/kvm ] && echo yes || echo no)"
+kv cpu_vmx_threads "$(grep -cwE 'vmx|svm' /proc/cpuinfo)"
+id
+
+sec "3 计算节点外网"
+env | grep -iE '^(https?|no|all)_proxy=' || echo "(无 proxy 环境变量)"
+getent hosts huggingface.co github.com www.google.com || echo "DNS 解析失败"
+for u in https://huggingface.co https://github.com https://www.google.com https://pypi.org/simple/ \
+         http://example.com https://registry-1.docker.io/v2/ http://portquiz.net:8080; do
+  r=$(probe_url "$u"); echo "  $u -> $r"; kv "net_$(slug "$u")" "$r"
+done
+
+sec "4 容器 / QEMU / KVM"
+kv singularity "$(singularity --version 2>&1)"
+kv podman "$(podman --version 2>&1 | head -1)"
+kv subuid_entries "$(grep -c "^$(id -un):" /etc/subuid 2>/dev/null || echo 0)"
+singularity exec "$SIF" true > /dev/null 2>&1 && kv sif_setuid_mount ok || kv sif_setuid_mount fail
+singularity exec --userns "$SIF" true > /dev/null 2>&1 && kv sif_userns_mount ok || kv sif_userns_mount fail
+singularity exec --userns "$SIF" sh -c 'ls -la /dev/kvm; qemu-system-x86_64 --version | head -1' 2>&1 | grep -v 'Mounting image'
+# -S 冻结 vCPU，什么都不跑；活到 timeout（rc=124）= KVM 加速可用
+timeout 8 singularity exec --userns "$SIF" qemu-system-x86_64 -accel kvm -machine q35 -m 256 \
+  -display none -S -nodefaults -monitor none -serial none > "$OUT/kvm_test.log" 2>&1
+rc=$?; grep -v 'Mounting image' "$OUT/kvm_test.log"
+kv qemu_kvm_accel "$([ $rc = 124 ] && echo ok || echo "fail_rc$rc")"
+
+sec "5 VM 镜像"
+if [ ! -s "$BASE" ]; then
+  if [ ! -s "$ZIP" ]; then   # 兜底：登录节点没下好时试一下作业内下载（同时也是对 [3] 的实测）
+    t0=$(date +%s)
+    curl -sSL --retry 3 --max-time 3600 -o "$ZIP.part-$JID" "$ZIP_URL" && mv "$ZIP.part-$JID" "$ZIP"
+    kv vm_zip_download "rc=$? $(( $(date +%s) - t0 ))s"
+  fi
+  if [ -s "$ZIP" ] && [ "$(stat -c %s "$ZIP")" = "$ZIP_BYTES" ]; then
+    t0=$(date +%s)
+    sha=$(sha256sum "$ZIP" | cut -d' ' -f1)
+    kv vm_zip_sha256 "$([ "$sha" = "$ZIP_SHA256" ] && echo ok || echo "MISMATCH:$sha") $(( $(date +%s) - t0 ))s"
+    if [ "$sha" = "$ZIP_SHA256" ]; then
+      t0=$(date +%s)
+      rm -rf "$ROOT/vm/.unzip-$JID"; mkdir -p "$ROOT/vm/.unzip-$JID"
+      unzip -q "$ZIP" -d "$ROOT/vm/.unzip-$JID" && mv "$ROOT/vm/.unzip-$JID/Ubuntu.qcow2" "$BASE"
+      kv vm_unzip "rc=$? $(( $(date +%s) - t0 ))s"
+    fi
+  else
+    kv vm_zip "missing_or_wrong_size($(stat -c %s "$ZIP" 2>/dev/null || echo 0))"
+  fi
+fi
+if [ -s "$BASE" ]; then
+  kv vm_base_bytes "$(stat -c %s "$BASE")"
+  singularity exec --userns -B "$ROOT/vm" "$SIF" qemu-img info "$BASE" 2>&1 | grep -v 'Mounting image' | head -8
+else
+  kv vm_base missing
+fi
+
+VM_OK=0
+sec "6 单台 VM 起机"
+if [ -s "$BASE" ]; then
+  t0=$(date +%s)
+  ipstr=$(bash "$LVM" start 0); echo "vm0 -> $ipstr"
+  P=$(port_of 0)
+  if bash "$LVM" wait 0 600; then
+    VM_OK=1
+    kv vm_boot "$(( $(date +%s) - t0 ))s"
+    curl -s --max-time 30 -o "$OUT/vm0_screenshot.png" "http://127.0.0.1:$P/screenshot"
+    kv vm_screenshot "$(file -b "$OUT/vm0_screenshot.png" | cut -c1-60)"
+    echo "platform: $(curl -s --max-time 20 "http://127.0.0.1:$P/platform")"
+    echo "--- VM 资源与网络配置"; vm_exec "$P" 'nproc; free -g | head -2; ip -4 addr show; ip route; cat /etc/resolv.conf'
+    for u in https://www.google.com https://huggingface.co http://example.com; do
+      r=$(vm_exec "$P" "python3 -c 'import sys,urllib.request; print(urllib.request.urlopen(sys.argv[1], timeout=20).status)' $u 2>&1 | tail -1")
+      echo "  in-VM $u -> $r"; kv "vmnet_$(slug "$u")" "$(echo "$r" | tail -1 | cut -c1-80)"
+    done
+  else
+    kv vm_boot "fail_after_$(( $(date +%s) - t0 ))s"
+    echo "--- qemu.log"; tail -40 "$VM_RUN_DIR/vm0/qemu.log"
+    echo "--- serial.log"; tail -c 4000 "$VM_RUN_DIR/vm0/serial.log" 2>/dev/null
+  fi
+  bash "$LVM" stop 0
+fi
+
+sec "7 并发 $NVM 台 VM"
+if [ "$VM_OK" = 1 ]; then
+  t0=$(date +%s)
+  for s in $(seq 1 "$NVM"); do bash "$LVM" start "$s" > /dev/null; done
+  declare -A ready=()
+  while (( $(date +%s) - t0 < 900 )) && (( ${#ready[@]} < NVM )); do
+    for s in $(seq 1 "$NVM"); do
+      [ -n "${ready[$s]:-}" ] && continue
+      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$(port_of "$s")/screenshot" || true)
+      [ "$code" = 200 ] && ready[$s]=$(( $(date +%s) - t0 )) && echo "  vm$s ready at ${ready[$s]}s"
+    done
+    sleep 3
+  done
+  kv vm_parallel "${#ready[@]}/$NVM ready, last at $(( $(date +%s) - t0 ))s"
+  free -g | head -2; uptime
+  mkdir -p "$OUT/parallel_screens"
+  : > "$OUT/parallel_boot_ids.txt"
+  for s in "${!ready[@]}"; do
+    curl -s --max-time 30 -o "$OUT/parallel_screens/vm$s.png" "http://127.0.0.1:$(port_of "$s")/screenshot"
+    echo "vm$s $(vm_exec "$(port_of "$s")" 'cat /proc/sys/kernel/random/boot_id' | tail -1)" >> "$OUT/parallel_boot_ids.txt"
+  done
+  # 每台 VM 的内核 boot_id 都不同 = 端口确实各自通到独立的 VM（截图会因桌面相同而相同，不能拿来判断）
+  kv vm_parallel_independent "$(awk '{print $2}' "$OUT/parallel_boot_ids.txt" | sort -u | wc -l) distinct boot_id / ${#ready[@]} ready"
+  stop_vms
+else
+  echo "跳过（单台 VM 未就绪）"
+fi
+
+sec "完成"
+cat "$SUM"
+outcome 0

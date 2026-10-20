@@ -1,0 +1,6 @@
+# Local runtime artifacts on the execution side (ABCI): VM images, environments, caches, logs, vendored harness clones
+/vm/
+/logs/
+/conda/
+/hf/
+/third_party/
