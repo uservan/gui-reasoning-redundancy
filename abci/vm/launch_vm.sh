@@ -19,7 +19,9 @@
 #   launch_vm.sh stop   <slot>
 #   launch_vm.sh status <slot>
 # ports: slot s -> 20000+10s (server), +1 (chrome), +2 (VNC), +3 (VLC); slot in 0..99
-# env:   GRR_ROOT, VM_SIF, VM_BASE (Ubuntu.qcow2), VM_RUN_DIR (default $PBS_LOCALDIR/grr_vms), VM_CPUS, VM_RAM
+# env:   GRR_ROOT, VM_SIF, VM_BASE (Ubuntu.qcow2), VM_RUN_DIR (default $PBS_LOCALDIR/grr_vms), VM_CPUS, VM_RAM,
+#        VM_ACCEL=kvm|tcg — ABCI PBS jobs deny /dev/kvm (EPERM from the job's device cgroup, probe job 2726256),
+#        so inside jobs only tcg (pure software emulation, multi-threaded) is available until that changes.
 # ============================================================
 set -euo pipefail
 
@@ -29,6 +31,7 @@ BASE=${VM_BASE:-$ROOT/vm/Ubuntu.qcow2}
 RUN_ROOT=${VM_RUN_DIR:-${PBS_LOCALDIR:-/tmp}/grr_vms}
 CPUS=${VM_CPUS:-4}
 RAM=${VM_RAM:-4G}
+ACCEL=${VM_ACCEL:-kvm}
 
 cmd=${1:?usage: launch_vm.sh start|wait|stop|status <slot> [timeout_s]}
 slot=${2:?slot (0..99) required}
@@ -61,11 +64,16 @@ case "$cmd" in
     net+=",hostfwd=tcp:127.0.0.1:$P_SERVER-20.20.20.21:5000"
     net+=",hostfwd=tcp:127.0.0.1:$P_CHROME-20.20.20.21:9222"
     net+=",hostfwd=tcp:127.0.0.1:$P_VLC-20.20.20.21:8080"
+    machine=type=q35,smm=off,graphics=off,vmport=off,dump-guest-core=off,hpet=off
+    case "$ACCEL" in
+      kvm) accel_args=(-machine "$machine,accel=kvm" -enable-kvm -global kvm-pit.lost_tick_policy=discard -cpu host) ;;
+      tcg) accel_args=(-machine "$machine" -accel tcg,thread=multi -cpu max) ;;
+      *)   echo "bad VM_ACCEL: $ACCEL (kvm|tcg)" >&2; exit 2 ;;
+    esac
     args=(
       -name "grr_vm$slot,process=grr_vm$slot"
-      -machine type=q35,smm=off,graphics=off,vmport=off,dump-guest-core=off,hpet=off,accel=kvm
-      -enable-kvm -global kvm-pit.lost_tick_policy=discard
-      -cpu host -smp "$CPUS,sockets=1,dies=1,cores=$CPUS,threads=1" -m "$RAM"
+      "${accel_args[@]}"
+      -smp "$CPUS,sockets=1,dies=1,cores=$CPUS,threads=1" -m "$RAM"
       -display "vnc=127.0.0.1:$((P_VNC - 5900))" -vga virtio
       -monitor "unix:$RUN/monitor.sock,server,nowait"
       -serial "file:$RUN/serial.log"

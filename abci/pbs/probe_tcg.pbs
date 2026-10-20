@@ -1,0 +1,142 @@
+#!/bin/bash
+# ============================================================
+# vangrr Gate-0b：没有 KVM 时，QEMU 纯软件模拟（TCG，多线程）能不能撑起 OSWorld 的 Ubuntu VM
+#
+# 背景：探测作业 2726256 实测 PBS 作业里打开 /dev/kvm 报 EPERM（作业的设备 cgroup 不放行，登录节点可用），KVM 起不了 VM。
+# 本作业测 TCG 下的实际速度，结论写 summary.txt（logs/probe_tcg/<jobid>/），实时日志 probe.log：
+#   [1] 复核 /dev/kvm（记录报错原文和 cgroup，用于向 ABCI 申请）
+#   [2] 4 vCPU（官方配置）起机：server(5000) 就绪耗时；截图延迟；动作开销（VM 内 python3 -c "import pyautogui"）；
+#       LibreOffice Calc / Chrome 从启动到窗口出现的耗时（wmctrl 轮询）；VM 内上网（经 slirp 出网）
+#   [3] 8 vCPU 同样测一遍（看加 vCPU 能否补偿）
+#   [4] 并发起 NVM 台（默认 16，4 vCPU）：各台就绪耗时、宿主负载
+# 对照（KVM 下的经验值）：起机 1 分钟内；Calc / Chrome 打开几秒；官方 harness 每个动作后等 2 s（DesktopEnv）+ 5 s（EvoCUA）再截图。
+#
+# 零 GPU，纯 bash + curl + singularity。预计 40–90 分钟，跑完自然退出。
+# 抢占：trap 写 outcome=term、停掉所有 VM、exit 143；幂等，被挤后原样重投。
+# 提交（须用户放行）：qsub abci/pbs/probe_tcg.pbs
+# ============================================================
+#PBS -N 0314_grr_probetcg
+#PBS -P gcg51557
+#PBS -q R9920261000
+#PBS -v RTYPE=rt_HF
+#PBS -l select=1
+#PBS -l walltime=02:30:00
+#PBS -j oe
+#PBS -o /groups/gcg51557/experiments/0314_clip-modality-gap/vangrr/logs/pbs_out/
+
+set -uo pipefail
+trap '' PIPE
+ROOT=/groups/gcg51557/experiments/0314_clip-modality-gap/vangrr
+JID=${PBS_JOBID:-manual$$}; JID=${JID%%.*}
+OUT=$ROOT/logs/probe_tcg/$JID
+mkdir -p "$OUT"
+OUTCOME=$OUT/outcome
+outcome() { echo "$1" > "$OUTCOME" 2>/dev/null || true; }
+outcome none
+exec > >(tee -a "$OUT/probe.log") 2>&1
+SUM=$OUT/summary.txt; : > "$SUM"
+kv()  { echo "$1=$2" | tee -a "$SUM"; }
+sec() { echo; echo "=== [$1] $(date '+%F %T') ==="; }
+
+LOCAL=${PBS_LOCALDIR:-/tmp}
+export TMPDIR=/tmp/g18422-$JID
+mkdir -p "$TMPDIR"
+export VM_RUN_DIR=$LOCAL/grr_vms
+export SINGULARITY_CACHEDIR=$ROOT/vm/sif_cache
+export SINGULARITY_TMPDIR=$LOCAL
+export VM_ACCEL=tcg
+LVM=$ROOT/abci/vm/launch_vm.sh
+NVM=${NVM:-16}
+
+stop_vms() { for s in $(seq 0 $((NVM + 1))); do bash "$LVM" stop "$s" > /dev/null 2>&1 || true; done; }  # 槽位 0..NVM+1
+trap 'stop_vms; rm -rf "$TMPDIR"' EXIT
+trap 'outcome term; echo "SIGTERM (preemption or walltime): stopping VMs"; stop_vms; exit 143' TERM
+
+port_of() { echo $((20000 + $1 * 10)); }
+vm_exec() {    # vm_exec <server_port> <shell command> [curl timeout]：打印 VM 内 stdout+stderr
+  local payload res
+  payload=$(jq -nc --arg c "$2" '{command: $c, shell: true}')
+  res=$(curl -s --max-time "${3:-130}" -X POST -H 'Content-Type: application/json' -d "$payload" "http://127.0.0.1:$1/execute")
+  echo "$res" | jq -r 'if .status == "success" then (.output + .error) else tostring end' 2>/dev/null || echo "$res"
+}
+t_req() {      # t_req <curl args...>：打印请求耗时（秒）
+  curl -s -o /dev/null -w '%{time_total}' --max-time 130 "$@"
+}
+# 在 VM 里起一个应用，轮询 wmctrl 直到窗口标题出现；打印耗时（毫秒）或 timeout（server 端单条命令上限 120 s）。
+# VM 里 shell=True 走 /bin/sh（dash），只用 POSIX 算术，不依赖 bc
+app_open_ms() { # app_open_ms <port> <launch cmd> <title regex>
+  vm_exec "$1" "export DISPLAY=\${DISPLAY:-:0}; t0=\$(date +%s%3N); ($2 > /dev/null 2>&1 &);
+    while ! wmctrl -l 2>/dev/null | grep -qiE '$3'; do sleep 0.5;
+      [ \$(( \$(date +%s%3N) - t0 )) -gt 110000 ] && { echo timeout; exit 0; }; done;
+    echo \$(( \$(date +%s%3N) - t0 ))" | tail -1
+}
+
+measure_vm() { # measure_vm <slot> <cpus> <tag>
+  local s=$1 cpus=$2 tag=$3 P t0 i lat
+  P=$(port_of "$s")
+  t0=$(date +%s)
+  VM_CPUS=$cpus bash "$LVM" start "$s" > /dev/null
+  if ! bash "$LVM" wait "$s" 2400; then
+    kv "${tag}_boot" "fail_after_$(( $(date +%s) - t0 ))s"
+    tail -20 "$VM_RUN_DIR/vm$s/qemu.log"; tail -c 3000 "$VM_RUN_DIR/vm$s/serial.log" 2>/dev/null
+    bash "$LVM" stop "$s"; return 1
+  fi
+  kv "${tag}_boot" "$(( $(date +%s) - t0 ))s"
+  sleep 60   # 桌面登录后的自启动项先跑完，再测稳态延迟
+  curl -s --max-time 60 -o "$OUT/${tag}_screenshot.png" "http://127.0.0.1:$P/screenshot"
+  lat=""; for i in 1 2 3 4 5; do lat+="$(t_req "http://127.0.0.1:$P/screenshot") "; done
+  kv "${tag}_screenshot_s" "$lat"
+  lat=""; for i in 1 2 3; do
+    lat+="$(t_req -X POST -H 'Content-Type: application/json' \
+      -d '{"command": "python3 -c \"import pyautogui; pyautogui.moveTo(200, 200)\"", "shell": true}' \
+      "http://127.0.0.1:$P/execute") "
+  done
+  kv "${tag}_pyautogui_action_s" "$lat"
+  kv "${tag}_calc_open_ms" "$(app_open_ms "$P" 'libreoffice --calc --norestore' 'LibreOffice Calc')"
+  kv "${tag}_chrome_open_ms" "$(app_open_ms "$P" 'google-chrome --no-first-run --no-default-browser-check' 'Google Chrome|Chromium')"
+  curl -s --max-time 60 -o "$OUT/${tag}_screenshot_apps.png" "http://127.0.0.1:$P/screenshot"
+  for u in https://www.google.com https://huggingface.co http://example.com; do
+    kv "${tag}_vmnet_$(echo "$u" | sed -E 's#^https?://##; s#[^A-Za-z0-9]+#_#g; s#_+$##')" \
+      "$(vm_exec "$P" "python3 -c 'import sys,urllib.request; print(urllib.request.urlopen(sys.argv[1], timeout=30).status)' $u 2>&1 | tail -1" | tail -1 | cut -c1-80)"
+  done
+  echo "--- VM 内信息"; vm_exec "$P" 'nproc; free -m | head -2; uptime; ip -4 addr show | grep inet; cat /etc/resolv.conf | grep -v "^#"'
+  uptime
+  bash "$LVM" stop "$s"
+}
+
+sec "1 复核 KVM"
+kv host "$(hostname)"
+ls -la /dev/kvm
+( : <> /dev/kvm ) 2> "$OUT/kvm_open.err" && kv kvm_open ok || kv kvm_open "fail: $(tr -d '\n' < "$OUT/kvm_open.err" | sed 's/.*: //')"
+kv cgroup "$(cat /proc/self/cgroup | tr '\n' ' ')"
+
+sec "2 TCG 4 vCPU（官方配置）"
+measure_vm 0 4 tcg4
+
+sec "3 TCG 8 vCPU"
+measure_vm 1 8 tcg8
+
+sec "4 并发 $NVM 台 TCG VM（4 vCPU）"
+t0=$(date +%s)
+for s in $(seq 2 $((NVM + 1))); do VM_CPUS=4 bash "$LVM" start "$s" > /dev/null; done
+declare -A ready=()
+while (( $(date +%s) - t0 < 2700 )) && (( ${#ready[@]} < NVM )); do
+  for s in $(seq 2 $((NVM + 1))); do
+    [ -n "${ready[$s]:-}" ] && continue
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$(port_of "$s")/screenshot" || true)
+    [ "$code" = 200 ] && ready[$s]=$(( $(date +%s) - t0 )) && echo "  vm$s ready at ${ready[$s]}s"
+  done
+  sleep 5
+done
+kv parallel_ready "${#ready[@]}/$NVM, last at $(( $(date +%s) - t0 ))s"
+kv parallel_host_load "$(cut -d' ' -f1-3 /proc/loadavg)"
+if (( ${#ready[@]} > 0 )); then
+  s=$(printf '%s\n' "${!ready[@]}" | sort -n | head -1)
+  lat=""; for i in 1 2 3; do lat+="$(t_req "http://127.0.0.1:$(port_of "$s")/screenshot") "; done
+  kv parallel_screenshot_s_under_load "$lat"
+fi
+stop_vms
+
+sec "完成"
+cat "$SUM"
+outcome 0
