@@ -1,0 +1,159 @@
+#!/bin/bash
+# ============================================================
+# vangrr Gate-1：不用 VM 的模型服务冒烟（一个节点 8 卡用满）
+#   GPU 0,1  EvoCUA-32B   TP=2  :8001   官方推荐 TP=2
+#   GPU 2,3  UI-Mate-27B  TP=2  :8002   官方推荐 TP=2
+#   GPU 4    EvoCUA-8B    TP=1  :8003
+#   GPU 5    UI-Mate-9B   TP=1  :8004   官方推荐 TP=1
+#   GPU 6    EvoCUA-32B   TP=1  :8005   试单卡放不放得下（给正式作业排布用；--max-model-len 131072，单卡 KV 放不下 256K）
+#   GPU 7    UI-Mate-27B  TP=1  :8006   同上
+# 服务参数照官方：EvoCUA 用其 README 的 vllm serve（served name 同时注册 EvoCUA-S2 / EvoCUA / evocua，runner 用哪个都能路由）；
+# UI-Mate 用其模型卡的 vllm serve 参数。两者都**不开 reasoning parser**（官方 harness 只读 message.content）。
+# 每个服务就绪后，用官方 agent 对 UI-Mate 仓库自带的 5 张 OSWorld 起始截图各走一步（abci/smoke/agent_smoke.py），记录原始返回：
+# 推理文本是否完整留在 content 里、动作能否解析、token 数与延迟；UI-Mate-27B（TP=2）和 UI-Mate-9B 再各跑官方示例的 4 步回放（多轮历史）。
+# 结果：logs/smoke/<jobid>/{summary.txt, smoke.log, servers/*.log, <端点>/steps.jsonl, <端点>/summary.json, replay_*/}
+# 抢占（SIGTERM / 271）：写 outcome=term、停掉所有服务、exit 143；本脚本幂等，被挤后原样重投。/dev/shm < 32 GB → exit 20（换节点）。
+# 提交（须用户放行）：qsub abci/pbs/smoke_serve.pbs
+# ============================================================
+#PBS -N 0314_grr_smoke
+#PBS -P gcg51557
+#PBS -q R9920261000
+#PBS -v RTYPE=rt_HF
+#PBS -l select=1
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -o /groups/gcg51557/experiments/0314_clip-modality-gap/vangrr/logs/pbs_out/
+
+set -uo pipefail
+trap '' PIPE
+ROOT=/groups/gcg51557/experiments/0314_clip-modality-gap/vangrr
+JID=${PBS_JOBID:-manual$$}; JID=${JID%%.*}
+OUT=$ROOT/logs/smoke/$JID
+mkdir -p "$OUT/servers"
+OUTCOME=$OUT/outcome
+outcome() { echo "$1" > "$OUTCOME" 2>/dev/null || true; }
+outcome none
+exec > >(tee -a "$OUT/smoke.log") 2>&1
+SUM=$OUT/summary.txt; : > "$SUM"
+kv()  { echo "$1=$2" | tee -a "$SUM"; }
+sec() { echo; echo "=== [$1] $(date '+%F %T') ==="; }
+
+export TMPDIR=/tmp/g18422-$JID   # ~/.bashrc 指向已满的 /home；要短（UNIX socket < 108 字节）
+mkdir -p "$TMPDIR"
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 TOKENIZERS_PARALLELISM=false
+unset HF_ENDPOINT
+CACHE=$ROOT/hf/cache   # 编译 / 内核缓存放 /groups，不落家目录
+export HF_HOME=$ROOT/hf XDG_CACHE_HOME=$CACHE VLLM_CACHE_ROOT=$CACHE/vllm TRITON_CACHE_DIR=$CACHE/triton TORCHINDUCTOR_CACHE_DIR=$CACHE/inductor
+mkdir -p "$CACHE"
+export OMP_NUM_THREADS=12 MKL_NUM_THREADS=12 OPENBLAS_NUM_THREADS=12
+export VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
+EVO_ENV=$ROOT/conda/envs/vllm-evocua
+UIM_ENV=$ROOT/conda/envs/vllm-uimate
+MODELS=$ROOT/models
+PIDS=()
+
+stop_servers() {
+  local p
+  for p in "${PIDS[@]}"; do kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null || true; done
+  for _ in $(seq 1 30); do
+    local alive=0; for p in "${PIDS[@]}"; do kill -0 "$p" 2>/dev/null && alive=1; done
+    [ "$alive" = 0 ] && break; sleep 1
+  done
+  for p in "${PIDS[@]}"; do kill -KILL -- "-$p" 2>/dev/null || true; done
+}
+trap 'stop_servers; rm -rf "$TMPDIR"' EXIT
+trap 'outcome term; echo "SIGTERM (preemption or walltime): stopping servers"; stop_servers; exit 143' TERM
+
+start_server() {  # start_server <name> <evocua|uimate> <model dir> <gpus> <tp> <port> [extra vllm args...]
+  local name=$1 fam=$2 model=$3 gpus=$4 tp=$5 port=$6; shift 6
+  local env args
+  if [ "$fam" = evocua ]; then
+    env=$EVO_ENV; args=(--served-model-name EvoCUA-S2 EvoCUA evocua)
+  else
+    env=$UIM_ENV
+    args=(--trust-remote-code --served-model-name UI_Mate --gpu-memory-utilization 0.85 --mm-encoder-tp-mode data
+          --chat-template-content-format openai --limit-mm-per-prompt '{"image":6,"video":0}')
+  fi
+  CUDA_VISIBLE_DEVICES=$gpus setsid "$env/bin/vllm" serve "$model" --host 127.0.0.1 --port "$port" \
+    --tensor-parallel-size "$tp" "${args[@]}" "$@" > "$OUT/servers/$name.log" 2>&1 < /dev/null &
+  PIDS+=($!)
+  echo "  $name: pid $! gpus $gpus tp $tp port $port"
+  sleep 5   # 错开启动，避免几个服务同时挑中同一个内部空闲端口
+}
+
+sec "0 前置检查"
+kv job "$JID"
+kv host "$(hostname)"
+ngpu=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
+kv gpus "$ngpu"
+[ "$ngpu" = 8 ] || { kv fatal "expected 8 GPUs"; outcome 10; exit 10; }
+shm=$(df -BG --output=avail /dev/shm | tail -1 | tr -dc 0-9)
+kv shm_free_gb "$shm"
+[ "${shm:-0}" -ge 32 ] || { kv fatal "/dev/shm < 32 GB on $(hostname)"; outcome 20; exit 20; }
+for m in EvoCUA-8B-20260105 EvoCUA-32B-20260105 UI-Mate-9B UI-Mate-27B; do
+  [ -f "$MODELS/$m/DOWNLOAD-COMPLETE" ] || { kv fatal "model $m incomplete"; outcome 10; exit 10; }
+done
+for e in "$EVO_ENV" "$UIM_ENV"; do
+  [ -f "$e/ENV-COMPLETE" ] || { kv fatal "env $e incomplete"; outcome 10; exit 10; }
+  "$e/bin/python" -m py_compile "$ROOT/abci/smoke/agent_smoke.py" || { kv fatal "py_compile failed in $e"; outcome 10; exit 10; }
+done
+kv vllm_versions "$("$EVO_ENV/bin/python" -c 'import vllm; print(vllm.__version__)' 2>/dev/null) / $("$UIM_ENV/bin/python" -c 'import vllm; print(vllm.__version__)' 2>/dev/null)"
+nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv,noheader
+
+sec "1 起 6 个服务（8 卡）"
+start_server evocua32b_tp2 evocua "$MODELS/EvoCUA-32B-20260105" 0,1 2 8001
+start_server uimate27b_tp2 uimate "$MODELS/UI-Mate-27B"         2,3 2 8002
+start_server evocua8b_tp1  evocua "$MODELS/EvoCUA-8B-20260105"  4   1 8003
+start_server uimate9b_tp1  uimate "$MODELS/UI-Mate-9B"          5   1 8004
+start_server evocua32b_tp1 evocua "$MODELS/EvoCUA-32B-20260105" 6   1 8005 --max-model-len 131072
+start_server uimate27b_tp1 uimate "$MODELS/UI-Mate-27B"         7   1 8006 --max-model-len 131072
+
+NAMES=(evocua32b_tp2 uimate27b_tp2 evocua8b_tp1 uimate9b_tp1 evocua32b_tp1 uimate27b_tp1)
+PORTS=(8001 8002 8003 8004 8005 8006)
+declare -A READY=()
+t0=$(date +%s)
+while (( $(date +%s) - t0 < 1800 )); do
+  pending=0
+  for i in "${!NAMES[@]}"; do
+    n=${NAMES[$i]}; [ -n "${READY[$n]:-}" ] && continue
+    if ! kill -0 "${PIDS[$i]}" 2>/dev/null; then READY[$n]="dead"; echo "  $n exited during startup"; continue; fi
+    if curl -sf --max-time 5 "http://127.0.0.1:${PORTS[$i]}/v1/models" > /dev/null; then
+      READY[$n]="$(( $(date +%s) - t0 ))s"; echo "  $n ready at ${READY[$n]}"
+    else pending=1; fi
+  done
+  [ "$pending" = 0 ] && break
+  sleep 10
+done
+for n in "${NAMES[@]}"; do
+  kv "ready_$n" "${READY[$n]:-timeout}"
+  [[ ${READY[$n]:-timeout} == *s ]] || { echo "--- $n log tail"; tail -30 "$OUT/servers/$n.log"; }
+done
+nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader
+
+sec "2 官方 agent 单步（5 张 OSWorld 起始截图 / 端点，6 个端点并行）"
+dpids=()
+for i in "${!NAMES[@]}"; do
+  n=${NAMES[$i]}; [[ ${READY[$n]:-} == *s ]] || continue
+  case $n in evocua*) fam=evocua env=$EVO_ENV model=EvoCUA-S2 ;; *) fam=uimate env=$UIM_ENV model=UI_Mate ;; esac
+  "$env/bin/python" "$ROOT/abci/smoke/agent_smoke.py" --family "$fam" --base-url "http://127.0.0.1:${PORTS[$i]}/v1" \
+    --model "$model" --out "$OUT/$n" > "$OUT/$n.driver.log" 2>&1 &
+  dpids+=($!)
+done
+for p in "${dpids[@]}"; do wait "$p"; done
+for n in "${NAMES[@]}"; do
+  [ -f "$OUT/$n/summary.json" ] || continue
+  kv "agent_$n" "$(jq -c '{ok: .no_error_with_actions, of: .examples, visible_reasoning, reasoning_moved_to_reasoning_content, mean_latency_s, mean_completion_tokens}' "$OUT/$n/summary.json")"
+done
+
+sec "3 UI-Mate 官方示例回放 4 步（多轮历史、thinking 进历史）"
+for i in 1 3; do   # uimate27b_tp2、uimate9b_tp1
+  n=${NAMES[$i]}; [[ ${READY[$n]:-} == *s ]] || continue
+  (cd "$ROOT/third_party/UI-Mate" && timeout 1800 "$UIM_ENV/bin/python" examples/run_agent.py --replay --steps 4 \
+     --base-url "http://127.0.0.1:${PORTS[$i]}/v1" --model UI_Mate --output-dir "$OUT/replay_$n" --show-response \
+     > "$OUT/replay_$n.log" 2>&1)
+  kv "replay_$n" "rc=$? $(tail -1 "$OUT/replay_$n.log" | cut -c1-120)"
+done
+
+sec "完成"
+cat "$SUM"
+outcome 0
